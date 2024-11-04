@@ -62,7 +62,7 @@ module apb_gpio #(
     output logic   [PAD_NUM-1:0]      gpio_out,
     output logic   [PAD_NUM-1:0]      gpio_dir,
     output logic   [PAD_NUM-1:0][NBIT_PADCFG-1:0] gpio_padcfg,
-    output logic                      interrupt
+    output logic   [PAD_NUM-1:0]      interrupt_o
 );
 
     logic [PAD_NUM-1:0]       r_gpio_inten;
@@ -95,7 +95,6 @@ module apb_gpio #(
     logic [PAD_NUM-1:0] s_is_int_rifa;
     logic [PAD_NUM-1:0] s_is_int_fall;
     logic [PAD_NUM-1:0] s_is_int_all;
-    logic        s_rise_int;
 
     logic  [4:0] s_apb_addr;
 
@@ -112,6 +111,9 @@ module apb_gpio #(
     logic        s_write;
 
     genvar i;
+
+    // Synchronization registers for interrupt signals
+    logic [PAD_NUM-1:0] interrupt, interrupt_sync;
 
     generate
         for(i=0;i<PAD_NUM;i++)
@@ -135,12 +137,24 @@ module apb_gpio #(
     end
 
     // check if bit if interrupt is enable and if interrupt specified by inttype occurred
-    assign s_is_int_all  = r_gpio_inten & r_gpio_en & (s_is_int_rise | s_is_int_fall | s_is_int_rifa);
+    assign s_is_int_all  = r_gpio_inten & ~r_gpio_dir & r_gpio_en & (s_is_int_rise | s_is_int_fall | s_is_int_rifa);
 
-    // is any bit enabled and specified interrupt happened?
-    assign s_rise_int = |s_is_int_all;
+    always_ff @(posedge HCLK or negedge HRESETn)
+    begin
+        if (~HRESETn)
+        begin
+            interrupt <= '0;
+            interrupt_sync <= '0;
+        end
+        else
+        begin
+            interrupt <= s_is_int_all;
+            interrupt_sync <= interrupt;
+        end
+    end
 
-    assign interrupt = s_rise_int;
+    // Assign synchronized interrupt signals to the output
+    assign interrupt_o = interrupt_sync;
 
     always_ff @(posedge HCLK, negedge HRESETn)
     begin
@@ -148,20 +162,30 @@ module apb_gpio #(
         begin
             r_status  <=  'h0;
         end else begin
-            if (s_rise_int) begin //rise interrupt if not already rise
-                r_status  <= r_status | s_is_int_all;
-            end
-            else if (PSEL && PENABLE && !PWRITE && (s_apb_addr == `REG_INTSTATUS_00_31)) //clears int if status is read
+            for(int i=0;i<PAD_NUM;i++)
             begin
-                for(int i=0;i<32;i++)
-                    if(i<PAD_NUM)
-                        r_status[i]  <= 1'b0;
+                if (s_is_int_all[i]) // if interrupt occurs, update status
+                    r_status[i]  <= 1'b1;
             end
-            else if (PSEL && PENABLE && !PWRITE && (s_apb_addr == `REG_INTSTATUS_32_63)) //clears int if status is read
+            // Clear interrupt status bits when the status register is read
+            if (PSEL && PENABLE && !PWRITE )
             begin
-                for(int i=32;i<64;i++)
-                    if(i<PAD_NUM)
-                        r_status[i]  <= 1'b0;
+                if (s_apb_addr == `REG_INTSTATUS_00_31) //clears int if status is read
+                begin
+                    for(int i=0;i<32;i++)
+                    begin
+                        if(i<PAD_NUM && PRDATA[i])
+                            r_status[i]  <= 1'b0;
+                    end
+                end
+                else if (s_apb_addr == `REG_INTSTATUS_32_63)
+                begin
+                    for(int i=32;i<64;i++)
+                    begin
+                        if(i<PAD_NUM && PRDATA[i - 32])
+                            r_status[i]  <= 1'b0;
+                    end
+                end
             end
         end
     end
@@ -170,7 +194,7 @@ module apb_gpio #(
         for (int i=0;i<64;i++)
         begin
             if(i<PAD_NUM)
-                s_cg_en[i] = r_gpio_en[i];
+                s_cg_en[i] = r_gpio_en[i] && dft_cg_enable_i;
             else
                 s_cg_en[i] = 1'b0;
         end
@@ -181,6 +205,7 @@ module apb_gpio #(
             s_clk_en[i] = s_cg_en[i*4] | s_cg_en[i*4+1] | s_cg_en[i*4+2] | s_cg_en[i*4+3];
     end
 
+    // GPIO Input Synchronization
     always_ff @(posedge HCLK or negedge HRESETn)
     begin
         if(~HRESETn)
@@ -206,6 +231,7 @@ module apb_gpio #(
         end
     end
 
+    // GPIO Configuration Registers Update
     always_ff @(posedge HCLK or negedge HRESETn) begin
         if(~HRESETn) begin
             for(int i=0;i<PAD_NUM;i++)
@@ -226,8 +252,11 @@ module apb_gpio #(
                         r_gpio_padcfg[i]  <= s_gpio_padcfg[i] ;
                     if(s_write_inttype[i])
                         r_gpio_inttype[i] <= s_gpio_inttype[i];
-                    if(s_write_dir[i])
-                        r_gpio_dir[i]     <= s_gpio_dir[i]    ;
+                    if(s_write_dir[i]) begin
+                        r_gpio_dir[i] <= s_gpio_dir[i];
+                        if(s_gpio_dir[i] == 1'b1) // 1 = output
+                            r_gpio_inten[i] <= 1'b0; // Automatically disable interrupt for output
+                    end
                     if(s_write_out[i])
                         r_gpio_out[i]     <= s_gpio_out[i]    ;
                     if(s_write_inten[i])
@@ -239,6 +268,7 @@ module apb_gpio #(
         end
     end
 
+    // APB Write Logic
     always_comb
     begin
         s_write       = 1'b0;
@@ -325,203 +355,130 @@ module apb_gpio #(
                 `REG_INTEN_00_31:
                 begin
                     s_write_inten[31:0] = 32'hFFFFFFFF;
-                    s_gpio_inten[31:0]  = PWDATA;
+                    for(int i = 0; i < 32; i++) begin
+                        if(i < PAD_NUM && ~r_gpio_dir[i])
+                            s_gpio_inten[i] = PWDATA[i];
+                        else
+                            s_gpio_inten[i] = r_gpio_inten[i]; // Keep existing value
+                    end
                 end
                 `REG_INTEN_32_63:
                 begin
                     s_write_inten[63:32] = 32'hFFFFFFFF;
-                    s_gpio_inten[63:32]  = PWDATA;
+                    for(int i = 32; i < 64; i++) begin
+                        if(i < PAD_NUM && ~r_gpio_dir[i])
+                            s_gpio_inten[i] = PWDATA[i];
+                        else
+                            s_gpio_inten[i] = r_gpio_inten[i]; // Keep existing value
+                    end
                 end
                 `REG_INTTYPE_00_15:
                 begin
                     s_write_inttype[15:0] = 16'hFFFF;
-                    s_gpio_inttype[0] = PWDATA[1:0];
-                    s_gpio_inttype[1] = PWDATA[3:2];
-                    s_gpio_inttype[2] = PWDATA[5:4];
-                    s_gpio_inttype[3] = PWDATA[7:6];
-                    s_gpio_inttype[4] = PWDATA[9:8];
-                    s_gpio_inttype[5] = PWDATA[11:10];
-                    s_gpio_inttype[6] = PWDATA[13:12];
-                    s_gpio_inttype[7] = PWDATA[15:14];
-                    s_gpio_inttype[8] = PWDATA[17:16];
-                    s_gpio_inttype[9] = PWDATA[19:18];
-                    s_gpio_inttype[10] = PWDATA[21:20];
-                    s_gpio_inttype[11] = PWDATA[23:22];
-                    s_gpio_inttype[12] = PWDATA[25:24];
-                    s_gpio_inttype[13] = PWDATA[27:26];
-                    s_gpio_inttype[14] = PWDATA[29:28];
-                    s_gpio_inttype[15] = PWDATA[31:30];
+                    for(int i=0; i<16; i++) begin
+                        if(i < PAD_NUM)
+                            s_gpio_inttype[i] = PWDATA[2*i +: 2];
+                    end
                 end
                 `REG_INTTYPE_16_31:
                 begin
                     s_write_inttype[31:16] = 16'hFFFF;
-                    s_gpio_inttype[16] = PWDATA[1:0];
-                    s_gpio_inttype[17] = PWDATA[3:2];
-                    s_gpio_inttype[18] = PWDATA[5:4];
-                    s_gpio_inttype[19] = PWDATA[7:6];
-                    s_gpio_inttype[20] = PWDATA[9:8];
-                    s_gpio_inttype[21] = PWDATA[11:10];
-                    s_gpio_inttype[22] = PWDATA[13:12];
-                    s_gpio_inttype[23] = PWDATA[15:14];
-                    s_gpio_inttype[24] = PWDATA[17:16];
-                    s_gpio_inttype[25] = PWDATA[19:18];
-                    s_gpio_inttype[26] = PWDATA[21:20];
-                    s_gpio_inttype[27] = PWDATA[23:22];
-                    s_gpio_inttype[28] = PWDATA[25:24];
-                    s_gpio_inttype[29] = PWDATA[27:26];
-                    s_gpio_inttype[30] = PWDATA[29:28];
-                    s_gpio_inttype[31] = PWDATA[31:30];
+                    for(int i=16; i<32; i++) begin
+                        if(i < PAD_NUM)
+                            s_gpio_inttype[i] = PWDATA[2*(i-16) +: 2];
+                    end
                 end
                 `REG_INTTYPE_32_47:
                 begin
                     s_write_inttype[47:32] = 16'hFFFF;
-                    s_gpio_inttype[32] = PWDATA[1:0];
-                    s_gpio_inttype[33] = PWDATA[3:2];
-                    s_gpio_inttype[34] = PWDATA[5:4];
-                    s_gpio_inttype[35] = PWDATA[7:6];
-                    s_gpio_inttype[36] = PWDATA[9:8];
-                    s_gpio_inttype[37] = PWDATA[11:10];
-                    s_gpio_inttype[38] = PWDATA[13:12];
-                    s_gpio_inttype[39] = PWDATA[15:14];
-                    s_gpio_inttype[40] = PWDATA[17:16];
-                    s_gpio_inttype[41] = PWDATA[19:18];
-                    s_gpio_inttype[42] = PWDATA[21:20];
-                    s_gpio_inttype[43] = PWDATA[23:22];
-                    s_gpio_inttype[44] = PWDATA[25:24];
-                    s_gpio_inttype[45] = PWDATA[27:26];
-                    s_gpio_inttype[46] = PWDATA[29:28];
-                    s_gpio_inttype[47] = PWDATA[31:30];
+                    for(int i=32; i<48; i++) begin
+                        if(i < PAD_NUM)
+                            s_gpio_inttype[i] = PWDATA[2*(i-32) +: 2];
+                    end
                 end
                 `REG_INTTYPE_48_63:
                 begin
                     s_write_inttype[63:48] = 16'hFFFF;
-                    s_gpio_inttype[48] = PWDATA[1:0];
-                    s_gpio_inttype[49] = PWDATA[3:2];
-                    s_gpio_inttype[50] = PWDATA[5:4];
-                    s_gpio_inttype[51] = PWDATA[7:6];
-                    s_gpio_inttype[52] = PWDATA[9:8];
-                    s_gpio_inttype[53] = PWDATA[11:10];
-                    s_gpio_inttype[54] = PWDATA[13:12];
-                    s_gpio_inttype[55] = PWDATA[15:14];
-                    s_gpio_inttype[56] = PWDATA[17:16];
-                    s_gpio_inttype[57] = PWDATA[19:18];
-                    s_gpio_inttype[58] = PWDATA[21:20];
-                    s_gpio_inttype[59] = PWDATA[23:22];
-                    s_gpio_inttype[60] = PWDATA[25:24];
-                    s_gpio_inttype[61] = PWDATA[27:26];
-                    s_gpio_inttype[62] = PWDATA[29:28];
-                    s_gpio_inttype[63] = PWDATA[31:30];
+                    for(int i=48; i<64; i++) begin
+                        if(i < PAD_NUM)
+                            s_gpio_inttype[i] = PWDATA[2*(i-48) +: 2];
+                    end
                 end
                 `REG_GPIOEN_00_31:
                 begin
                     s_write_gpen[31:0] = 32'hFFFFFFFF;
-                    s_gpio_en[31:0]    = PWDATA;
+                    for(int i=0; i<32; i++)
+                        if(i < PAD_NUM)
+                            s_gpio_en[i] = PWDATA[i];
                 end
                 `REG_GPIOEN_32_63:
                 begin
                     s_write_gpen[63:32] = 32'hFFFFFFFF;
-                    s_gpio_en[63:32]    = PWDATA;
+                    for(int i=32; i<64; i++)
+                        if(i < PAD_NUM)
+                            s_gpio_en[i] = PWDATA[i-32];
                 end
                 `REG_PADCFG_00_07:
                 begin
                     s_write_cfg[7:0]  = 8'hFF;
-                    s_gpio_padcfg[0]  = PWDATA[3:0];
-                    s_gpio_padcfg[1]  = PWDATA[7:4];
-                    s_gpio_padcfg[2]  = PWDATA[11:8];
-                    s_gpio_padcfg[3]  = PWDATA[15:12];
-                    s_gpio_padcfg[4]  = PWDATA[19:16];
-                    s_gpio_padcfg[5]  = PWDATA[23:20];
-                    s_gpio_padcfg[6]  = PWDATA[27:24];
-                    s_gpio_padcfg[7]  = PWDATA[31:28];
+                    for(int i=0; i<8; i++)
+                        if(i < PAD_NUM)
+                            s_gpio_padcfg[i]  = PWDATA[4*i +: 4];
                 end
                 `REG_PADCFG_08_15:
                 begin
                     s_write_cfg[15:8] = 8'hFF;
-                    s_gpio_padcfg[8]  = PWDATA[3:0];
-                    s_gpio_padcfg[9]  = PWDATA[7:4];
-                    s_gpio_padcfg[10] = PWDATA[11:8];
-                    s_gpio_padcfg[11] = PWDATA[15:12];
-                    s_gpio_padcfg[12] = PWDATA[19:16];
-                    s_gpio_padcfg[13] = PWDATA[23:20];
-                    s_gpio_padcfg[14] = PWDATA[27:24];
-                    s_gpio_padcfg[15] = PWDATA[31:28];
+                    for(int i=8; i<16; i++)
+                        if(i < PAD_NUM)
+                            s_gpio_padcfg[i]  = PWDATA[4*(i-8) +: 4];
                 end
                 `REG_PADCFG_16_23:
                 begin
                     s_write_cfg[23:16] = 8'hFF;
-                    s_gpio_padcfg[16]  = PWDATA[3:0];
-                    s_gpio_padcfg[17]  = PWDATA[7:4];
-                    s_gpio_padcfg[18]  = PWDATA[11:8];
-                    s_gpio_padcfg[19]  = PWDATA[15:12];
-                    s_gpio_padcfg[20]  = PWDATA[19:16];
-                    s_gpio_padcfg[21]  = PWDATA[23:20];
-                    s_gpio_padcfg[22]  = PWDATA[27:24];
-                    s_gpio_padcfg[23]  = PWDATA[31:28];
+                    for(int i=16; i<24; i++)
+                        if(i < PAD_NUM)
+                            s_gpio_padcfg[i]  = PWDATA[4*(i-16) +: 4];
                 end
                 `REG_PADCFG_24_31:
                 begin
                     s_write_cfg[31:24] = 8'hFF;
-                    s_gpio_padcfg[24]  = PWDATA[3:0];
-                    s_gpio_padcfg[25]  = PWDATA[7:4];
-                    s_gpio_padcfg[26]  = PWDATA[11:8];
-                    s_gpio_padcfg[27]  = PWDATA[15:12];
-                    s_gpio_padcfg[28]  = PWDATA[19:16];
-                    s_gpio_padcfg[29]  = PWDATA[23:20];
-                    s_gpio_padcfg[30]  = PWDATA[27:24];
-                    s_gpio_padcfg[31]  = PWDATA[31:28];
+                    for(int i=24; i<32; i++)
+                        if(i < PAD_NUM)
+                            s_gpio_padcfg[i]  = PWDATA[4*(i-24) +: 4];
                 end
                 `REG_PADCFG_32_39:
                 begin
                     s_write_cfg[39:32] = 8'hFF;
-                    s_gpio_padcfg[32]  = PWDATA[3:0];
-                    s_gpio_padcfg[33]  = PWDATA[7:4];
-                    s_gpio_padcfg[34]  = PWDATA[11:8];
-                    s_gpio_padcfg[35]  = PWDATA[15:12];
-                    s_gpio_padcfg[36]  = PWDATA[19:16];
-                    s_gpio_padcfg[37]  = PWDATA[23:20];
-                    s_gpio_padcfg[38]  = PWDATA[27:24];
-                    s_gpio_padcfg[39]  = PWDATA[31:28];
+                    for(int i=32; i<40; i++)
+                        if(i < PAD_NUM)
+                            s_gpio_padcfg[i]  = PWDATA[4*(i-32) +: 4];
                 end
                 `REG_PADCFG_40_47:
                 begin
                     s_write_cfg[47:40] = 8'hFF;
-                    s_gpio_padcfg[40]  = PWDATA[3:0];
-                    s_gpio_padcfg[41]  = PWDATA[7:4];
-                    s_gpio_padcfg[42]  = PWDATA[11:8];
-                    s_gpio_padcfg[43]  = PWDATA[15:12];
-                    s_gpio_padcfg[44]  = PWDATA[19:16];
-                    s_gpio_padcfg[45]  = PWDATA[23:20];
-                    s_gpio_padcfg[46]  = PWDATA[27:24];
-                    s_gpio_padcfg[47]  = PWDATA[31:28];
+                    for(int i=40; i<48; i++)
+                        if(i < PAD_NUM)
+                            s_gpio_padcfg[i]  = PWDATA[4*(i-40) +: 4];
                 end
                 `REG_PADCFG_48_55:
                 begin
                     s_write_cfg[55:48] = 8'hFF;
-                    s_gpio_padcfg[48]  = PWDATA[3:0];
-                    s_gpio_padcfg[49]  = PWDATA[7:4];
-                    s_gpio_padcfg[50]  = PWDATA[11:8];
-                    s_gpio_padcfg[51]  = PWDATA[15:12];
-                    s_gpio_padcfg[52]  = PWDATA[19:16];
-                    s_gpio_padcfg[53]  = PWDATA[23:20];
-                    s_gpio_padcfg[54]  = PWDATA[27:24];
-                    s_gpio_padcfg[55]  = PWDATA[31:28];
+                    for(int i=48; i<56; i++)
+                        if(i < PAD_NUM)
+                            s_gpio_padcfg[i]  = PWDATA[4*(i-48) +: 4];
                 end
                 `REG_PADCFG_56_63:
                 begin
                     s_write_cfg[63:56] = 8'hFF;
-                    s_gpio_padcfg[56]  = PWDATA[3:0];
-                    s_gpio_padcfg[57]  = PWDATA[7:4];
-                    s_gpio_padcfg[58]  = PWDATA[11:8];
-                    s_gpio_padcfg[59]  = PWDATA[15:12];
-                    s_gpio_padcfg[60]  = PWDATA[19:16];
-                    s_gpio_padcfg[61]  = PWDATA[23:20];
-                    s_gpio_padcfg[62]  = PWDATA[27:24];
-                    s_gpio_padcfg[63]  = PWDATA[31:28];
+                    for(int i=56; i<64; i++)
+                        if(i < PAD_NUM)
+                            s_gpio_padcfg[i]  = PWDATA[4*(i-56) +: 4];
                 end
             endcase
         end
     end
 
+    // APB Read Logic
     always_comb
     begin
         if (PSEL && PENABLE && !PWRITE)
