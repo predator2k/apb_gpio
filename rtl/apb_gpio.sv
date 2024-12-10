@@ -7,6 +7,8 @@
 // this License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
 // CONDITIONS OF ANY KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations under the License.
+`resetall
+`timescale 1ns / 1ps
 
 `define REG_PADDIR_00_31    5'b00000 //BASEADDR+0x00
 `define REG_GPIOEN_00_31    5'b00001 //BASEADDR+0x04
@@ -784,3 +786,5 @@ module apb_gpio #(
     assign PSLVERR = 1'b0;
 
 endmodule
+
+`resetall
