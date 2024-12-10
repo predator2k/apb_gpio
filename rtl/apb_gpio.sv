@@ -48,8 +48,6 @@ module apb_gpio #(
     input  logic                      HCLK,
     input  logic                      HRESETn,
 
-    input  logic                      dft_cg_enable_i,
-
     input  logic [APB_ADDR_WIDTH-1:0] PADDR,
     input  logic               [31:0] PWDATA,
     input  logic                      PWRITE,
